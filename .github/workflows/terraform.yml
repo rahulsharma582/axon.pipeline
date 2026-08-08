@@ -33,7 +33,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: ./enviornment
+        working-directory: .
 
     steps:
       - name: Checkout Repository
@@ -51,7 +51,7 @@ jobs:
 
       - name: Terraform Init
         id: init
-        run: terraform init -input=false
+        run: terraform init 
 
       - name: Terraform Validate
         id: validate
