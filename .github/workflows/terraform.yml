@@ -1,34 +1,39 @@
-name: 'Terraform CI/CD Pipeline'
+name: Terraform CI/CD Pipeline
 
 on:
   push:
-    branches:
+    branches-ignore:
       - main
       - master
   pull_request:
     branches:
       - main
       - master
+  workflow_dispatch:   # allows manual trigger too
 
 permissions:
   contents: read
   pull-requests: write
+  id-token: write
 
 env:
-  # Azure Service Principal credentials - GitHub repo Settings > Secrets and variables > Actions me add karo
-  ARM_CLIENT_ID:"b7cc0a1e-57da-473a-8c04-6a4d21ce1c85"
-  ARM_CLIENT_SECRET:"Lwt8Q~Z8lXVlyUP~lHqXgqFT.6hI5KNs~cAj6aCI"
-  ARM_SUBSCRIPTION_ID:"c4b77061-0024-4ace-a30b-97358212e3ef"
-  ARM_TENANT_ID:"9760c339-90c7-40e3-bf80-2c3bee82448d"
+  # Azure Service Principal credentials — stored as GitHub repo secrets
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
   TF_IN_AUTOMATION: true
+  # Adjust this to match the actual path to your Terraform root in the repo
+  TF_WORKING_DIR: ./enviornment/axon.pipeline
 
 jobs:
-  terraform:
-    name: 'Terraform Validation & Plan'
+  terraform-plan:
+    name: Terraform Init / Fmt / Validate / Plan
     runs-on: ubuntu-latest
+
     defaults:
       run:
-        working-directory: ./environment
+        working-directory: ${{ env.TF_WORKING_DIR }}
 
     steps:
       - name: Checkout Repository
@@ -37,22 +42,78 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.14.8
+          terraform_version: "1.9.0"
 
       - name: Terraform Format Check
-        run: terraform fmt -check -recursive ../
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true   # fmt fail hone par bhi aage badhe, lekin visible rahe
 
       - name: Terraform Init
-        run: terraform init -backend=false
+        id: init
+        run: terraform init -input=false
 
       - name: Terraform Validate
+        id: validate
         run: terraform validate
 
       - name: Terraform Plan
-        run: terraform plan 
+        id: plan
+        run: terraform plan -input=false -no-color -out=tfplan
         continue-on-error: false
 
       - name: Fmt Check Result
         if: steps.fmt.outcome == 'failure'
         run: |
           echo "::warning::Terraform files are not properly formatted. Run 'terraform fmt -recursive' locally."
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 5
+
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan Result 📝
+            - Fmt: \`${{ steps.fmt.outcome }}\`
+            - Init: \`${{ steps.init.outcome }}\`
+            - Validate: \`${{ steps.validate.outcome }}\`
+            - Plan: \`${{ steps.plan.outcome }}\`
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production   # optional: add manual approval via GitHub Environments
+
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Apply
