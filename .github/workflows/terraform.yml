@@ -14,7 +14,7 @@ permissions:
   contents: read
   pull-requests: write
 
-  env:
+env:
   # Azure Service Principal credentials - GitHub repo Settings > Secrets and variables > Actions me add karo
   ARM_CLIENT_ID: "b7cc0a1e-57da-473a-8c04-6a4d21ce1c85"
   ARM_CLIENT_SECRET: "Lwt8Q~Z8lXVlyUP~lHqXgqFT.6hI5KNs~cAj6aCI"
