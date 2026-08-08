@@ -24,7 +24,7 @@ env:
   ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
   TF_IN_AUTOMATION: true
   # Adjust this to match the actual path to your Terraform root in the repo
-  TF_WORKING_DIR: ./enviornment
+  TF_WORKING_DIR: .
 
 jobs:
   terraform-plan:
