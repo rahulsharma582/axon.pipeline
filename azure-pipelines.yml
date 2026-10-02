@@ -1,0 +1,476 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  name: Rahul
+
+# ============================================================
+# VARIABLES
+# ============================================================
+variables:
+- group: Axion-Preprod-Secrets
+
+- name: terraformVersion
+  value: '1.9.8'
+
+- name: azureServiceConnection
+  value: 'Azure-Terraform-Connection'
+
+- name: terraformWorkingDirectory
+  value: '$(Build.SourcesDirectory)'
+
+- name: terraformPlanFile
+  value: '$(Build.ArtifactStagingDirectory)/axion.tfplan'
+
+- name: imageTag
+  value: '$(Build.SourceVersion)'
+
+# Existing working Terraform backend
+- name: stateResourceGroup
+  value: 'TerraformRB'
+
+- name: stateStorageAccount
+  value: 'terraformrbstate1'
+
+- name: stateContainer
+  value: 'tfstate'
+
+- name: stateKey
+  value: 'terraform.tfstate'
+
+
+# ============================================================
+# CI
+# ============================================================
+stages:
+
+- stage: CI
+  displayName: 'CI - Validate, Security Scan & Build'
+
+  jobs:
+
+  - job: Validate
+    displayName: 'Terraform and Docker validation'
+
+    steps:
+
+    - checkout: self
+      clean: true
+
+    # --------------------------------------------------------
+    # Terraform
+    # --------------------------------------------------------
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    - task: AzureCLI@2
+      displayName: 'Azure login'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+          $ErrorActionPreference = 'Stop'
+          az account show --output table
+
+    - powershell: |
+        terraform fmt -check -recursive
+      displayName: 'Terraform format check'
+      workingDirectory: '$(terraformWorkingDirectory)'
+
+    - powershell: |
+        terraform init -backend=false
+        terraform validate
+      displayName: 'Terraform init and validate'
+      workingDirectory: '$(terraformWorkingDirectory)'
+
+    # --------------------------------------------------------
+    # Secret scan
+    # --------------------------------------------------------
+    - powershell: |
+        if (Get-Command gitleaks -ErrorAction SilentlyContinue) {
+          gitleaks detect --source . --no-banner
+        }
+        else {
+          Write-Host 'Gitleaks not installed on agent; configure the approved scanner on the self-hosted agent.'
+        }
+      displayName: 'Secret scan'
+      workingDirectory: '$(terraformWorkingDirectory)'
+
+    # --------------------------------------------------------
+    # Terraform security scan
+    # --------------------------------------------------------
+    - powershell: |
+        if (Get-Command tfsec -ErrorAction SilentlyContinue) {
+          tfsec .
+        }
+        else {
+          Write-Host 'tfsec not installed on agent; install it or replace with approved IaC scanner.'
+        }
+      displayName: 'Terraform security scan'
+      workingDirectory: '$(terraformWorkingDirectory)'
+
+    # --------------------------------------------------------
+    # Docker validation
+    # --------------------------------------------------------
+    - powershell: |
+        docker version
+        docker build -t axion-local:$(Build.BuildId) ./axion
+      displayName: 'Build Axion container'
+
+
+# ============================================================
+# TERRAFORM PLAN
+# ============================================================
+
+- stage: PLAN
+  displayName: 'Plan - Terraform'
+  dependsOn: CI
+  condition: succeeded()
+
+  jobs:
+
+  - job: Plan
+    displayName: 'Terraform plan'
+
+    steps:
+
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    - task: AzureCLI@2
+      displayName: 'Terraform init and plan'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: ps
+        scriptLocation: inlineScript
+
+        inlineScript: |
+
+          $ErrorActionPreference = 'Stop'
+
+          # --------------------------------------------------
+          # Temporary Terraform variables
+          # --------------------------------------------------
+          $tfvars = Join-Path $env:AGENT_TEMPDIRECTORY 'axion.auto.tfvars'
+
+          @"
+          project_name = "axion"
+          environment = "preprod"
+          location = "Central India"
+          dr_location = "South India"
+
+          admin_username = "$(TF_ADMIN_USERNAME)"
+          admin_ssh_public_key = "$(TF_ADMIN_SSH_PUBLIC_KEY)"
+
+          postgres_admin_username = "$(TF_POSTGRES_ADMIN_USERNAME)"
+          postgres_admin_password = "$(TF_POSTGRES_ADMIN_PASSWORD)"
+
+          alert_email = "$(TF_ALERT_EMAIL)"
+          "@ | Out-File -FilePath $tfvars -Encoding utf8
+
+          # --------------------------------------------------
+          # Get Terraform backend access key
+          # --------------------------------------------------
+          $backendAccessKey = az storage account keys list `
+            --resource-group "$(stateResourceGroup)" `
+            --account-name "$(stateStorageAccount)" `
+            --query "[0].value" `
+            -o tsv
+
+          if ([string]::IsNullOrWhiteSpace($backendAccessKey)) {
+            throw "Unable to retrieve Terraform state storage account key."
+          }
+
+          # Terraform AzureRM backend uses this environment variable
+          $env:ARM_ACCESS_KEY = $backendAccessKey
+
+          # --------------------------------------------------
+          # Terraform backend
+          # --------------------------------------------------
+          terraform init `
+            -input=false `
+            -backend-config="resource_group_name=$(stateResourceGroup)" `
+            -backend-config="storage_account_name=$(stateStorageAccount)" `
+            -backend-config="container_name=$(stateContainer)" `
+            -backend-config="key=$(stateKey)"
+
+          # --------------------------------------------------
+          # Terraform plan
+          # --------------------------------------------------
+          terraform plan `
+            -input=false `
+            -out="$(terraformPlanFile)" `
+            -var-file="$tfvars"
+
+      workingDirectory: '$(terraformWorkingDirectory)'
+
+    # --------------------------------------------------------
+    # Publish saved plan
+    # --------------------------------------------------------
+    - publish: '$(terraformPlanFile)'
+      artifact: terraform-plan
+      displayName: 'Publish Terraform plan'
+
+
+# ============================================================
+# MANUAL APPROVAL
+# ============================================================
+
+- stage: APPROVAL
+  displayName: 'Approval - Pre-production'
+  dependsOn: PLAN
+  condition: succeeded()
+
+  jobs:
+
+  - job: ManualApproval
+    displayName: 'Manual approval'
+
+    pool: server
+
+    timeoutInMinutes: 1440
+
+    steps:
+
+    - task: ManualValidation@1
+      timeoutInMinutes: 1440
+
+      inputs:
+        notifyUsers: '$(TF_APPROVER_EMAIL)'
+
+        instructions: |
+          Review the Terraform plan artifact.
+          Approve only if the pre-production change is expected.
+
+        onTimeout: 'reject'
+
+
+# ============================================================
+# TERRAFORM APPLY + DOCKER + ACR + VM DEPLOYMENT
+# ============================================================
+
+- stage: APPLY_AND_DEPLOY
+  displayName: 'Apply infrastructure and deploy Axion'
+
+  dependsOn: APPROVAL
+  condition: succeeded()
+
+  jobs:
+
+  - job: Apply
+    displayName: 'Terraform apply and Axion deployment'
+
+    steps:
+
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    # --------------------------------------------------------
+    # Download approved Terraform plan
+    # --------------------------------------------------------
+    - download: current
+      artifact: terraform-plan
+
+    - task: AzureCLI@2
+      displayName: 'Terraform apply, Docker build, ACR push and VM deployment'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: ps
+        scriptLocation: inlineScript
+
+        inlineScript: |
+
+          $ErrorActionPreference = 'Stop'
+
+          # ==================================================
+          # Temporary Terraform variables
+          # ==================================================
+
+          $tfvars = Join-Path $env:AGENT_TEMPDIRECTORY 'axion.auto.tfvars'
+
+          @"
+          project_name = "axion"
+          environment = "preprod"
+          location = "Central India"
+          dr_location = "South India"
+
+          admin_username = "$(TF_ADMIN_USERNAME)"
+          admin_ssh_public_key = "$(TF_ADMIN_SSH_PUBLIC_KEY)"
+
+          postgres_admin_username = "$(TF_POSTGRES_ADMIN_USERNAME)"
+          postgres_admin_password = "$(TF_POSTGRES_ADMIN_PASSWORD)"
+
+          alert_email = "$(TF_ALERT_EMAIL)"
+          "@ | Out-File -FilePath $tfvars -Encoding utf8
+
+
+          # ==================================================
+          # Terraform backend authentication
+          # ==================================================
+
+          $backendAccessKey = az storage account keys list `
+            --resource-group "$(stateResourceGroup)" `
+            --account-name "$(stateStorageAccount)" `
+            --query "[0].value" `
+            -o tsv
+
+          if ([string]::IsNullOrWhiteSpace($backendAccessKey)) {
+            throw "Unable to retrieve Terraform state storage account key."
+          }
+
+          $env:ARM_ACCESS_KEY = $backendAccessKey
+
+
+          # ==================================================
+          # Terraform init
+          # ==================================================
+
+          terraform init `
+            -input=false `
+            -backend-config="resource_group_name=$(stateResourceGroup)" `
+            -backend-config="storage_account_name=$(stateStorageAccount)" `
+            -backend-config="container_name=$(stateContainer)" `
+            -backend-config="key=$(stateKey)"
+
+
+          # ==================================================
+          # Apply approved Terraform plan
+          # ==================================================
+
+          terraform apply `
+            -input=false `
+            "$(Pipeline.Workspace)\terraform-plan\axion.tfplan"
+
+
+          # ==================================================
+          # Read Terraform outputs
+          # ==================================================
+
+          $acr = terraform output -raw acr_name
+          $loginServer = terraform output -raw acr_login_server
+          $vm = terraform output -raw app_vm_name
+          $rg = terraform output -raw app_vm_resource_group
+
+          Write-Host "ACR: $acr"
+          Write-Host "VM: $vm"
+          Write-Host "Resource Group: $rg"
+
+
+          # ==================================================
+          # Login to ACR from Azure DevOps agent
+          # ==================================================
+
+          az acr login --name $acr
+
+
+          # ==================================================
+          # Build Axion Docker image
+          # ==================================================
+
+          docker build `
+            -t "$loginServer/axion:$(imageTag)" `
+            ./axion
+
+
+          # ==================================================
+          # Push Axion image to ACR
+          # ==================================================
+
+          docker push "$loginServer/axion:$(imageTag)"
+          # ==================================================
+          # Get ACR admin credentials
+          # ==================================================
+
+          $acrUsername = az acr credential show `
+            --name $acr `
+            --query "username" `
+            -o tsv
+
+          $acrPassword = az acr credential show `
+            --name $acr `
+            --query "passwords[0].value" `
+            -o tsv
+
+          if ([string]::IsNullOrWhiteSpace($acrUsername)) {
+            throw "Unable to retrieve ACR username."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($acrPassword)) {
+            throw "Unable to retrieve ACR password."
+          }
+
+
+          # ==================================================
+          # Deploy Axion to private VM
+          # ==================================================
+
+          $script = @"
+          #!/bin/bash
+
+          set -euo pipefail
+
+          echo '$acrPassword' | sudo docker login $loginServer -u '$acrUsername' --password-stdin
+
+          sudo docker pull $loginServer/axion:$(imageTag)
+
+          sudo docker rm -f axion >/dev/null 2>&1 || true
+
+          sudo docker run -d \
+            --name axion \
+            --restart unless-stopped \
+            -p 8080:8080 \
+            --health-cmd='curl -fsS http://127.0.0.1:8080/health || exit 1' \
+            --health-interval=30s \
+            --health-timeout=5s \
+            --health-retries=3 \
+            $loginServer/axion:$(imageTag)
+
+          sudo docker image prune -af --filter 'until=168h' || true
+
+          curl -fsS http://127.0.0.1:8080/health
+
+          "@
+
+
+          # ==================================================
+          # Execute deployment on VM
+          # ==================================================
+
+          az vm run-command invoke `
+            --resource-group $rg `
+            --name $vm `
+            --command-id RunShellScript `
+            --scripts $script
+
+
+          # ==================================================
+          # Final application URL
+          # ==================================================
+
+          $url = terraform output -raw application_url
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "Axion deployment completed successfully."
+          Write-Host "Axion URL: $url"
+          Write-Host "=============================================="
+
+         

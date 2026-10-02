@@ -1,0 +1,11 @@
+project_name = "axion"
+environment  = "preprod"
+location     = "Central India"
+dt_location  = "South India"
+admin_username = "azureadmin"
+
+# Set these securely in Azure DevOps pipeline variables; do not commit real values.
+admin_ssh_public_key    = "ssh-rsa AAAA..."
+postgres_admin_username = "axionadmin"
+postgres_admin_password = "CHANGE-ME"
+alert_email             = "your-email@example.com"

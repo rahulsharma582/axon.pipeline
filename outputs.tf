@@ -1,0 +1,12 @@
+output "resource_group_name" { value = azurerm_resource_group.main.name }
+output "application_gateway_public_ip" { value = azurerm_public_ip.appgw.ip_address }
+output "application_url" { value = "http://${azurerm_public_ip.appgw.ip_address}" }
+output "app_vm_name" { value = azurerm_linux_virtual_machine.app.name }
+output "app_vm_private_ip" { value = azurerm_network_interface.app.private_ip_address }
+output "app_vm_resource_group" { value = azurerm_resource_group.main.name }
+output "acr_login_server" { value = azurerm_container_registry.acr.login_server }
+output "acr_name" { value = azurerm_container_registry.acr.name }
+output "postgres_server_name" { value = azurerm_postgresql_flexible_server.db.name }
+output "postgres_database_name" { value = azurerm_postgresql_flexible_server_database.axion.name }
+output "log_analytics_workspace" { value = azurerm_log_analytics_workspace.main.name }
+output "recovery_services_vault" { value = azurerm_recovery_services_vault.backup.name }
